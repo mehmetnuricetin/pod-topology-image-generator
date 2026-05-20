@@ -431,12 +431,388 @@ def generate_image_with_luma(cluster_summary: str, output_path: str) -> None:
     print(f"  Image saved to: {output_file.resolve()}")
 
 
-def validate_env():
+def generate_image_with_openai(cluster_summary: str, output_path: str) -> None:
+    """
+    Build the final image prompt with the cluster summary injected, then call
+    the OpenAI DALL-E 3 image generation API and save the result.
+    """
+    final_prompt = IMAGE_PROMPT_TEMPLATE.format(cluster_summary=cluster_summary)
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    print("  Submitting image generation request to OpenAI (DALL-E 3) ...")
+    try:
+        response = client.images.generate(
+            model="dall-e-3",
+            prompt=final_prompt,
+            size="1792x1024",
+            quality="standard",
+            n=1,
+        )
+        image_url = response.data[0].url
+    except Exception as e:
+        print(f"ERROR: OpenAI DALL-E 3 image generation failed: {e}")
+        sys.exit(1)
+
+    print(f"  Downloading image from OpenAI ...")
+    try:
+        img_response = requests.get(image_url, timeout=60)
+        img_response.raise_for_status()
+    except Exception as e:
+        print(f"ERROR: Failed to download generated image: {e}")
+        sys.exit(1)
+
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_bytes(img_response.content)
+
+    print(f"  Image saved to: {output_file.resolve()}")
+
+
+def generate_mermaid_with_openai(resources: dict) -> str:
+    """
+    Use OpenAI to generate a Mermaid.js diagram definition representing the topology.
+    """
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # Slim down resources as in analyze_with_openai
+    slim = {
+        "ingresses": [
+            {
+                "name":      i.get("metadata", {}).get("name"),
+                "namespace": i.get("metadata", {}).get("namespace"),
+                "rules":     i.get("spec", {}).get("rules", []),
+                "tls":       i.get("spec", {}).get("tls", []),
+            }
+            for i in resources["ingresses"]
+        ],
+        "services": [
+            {
+                "name":      s.get("metadata", {}).get("name"),
+                "namespace": s.get("metadata", {}).get("namespace"),
+                "type":      s.get("spec", {}).get("type"),
+                "selector":  s.get("spec", {}).get("selector", {}),
+                "ports":     s.get("spec", {}).get("ports", []),
+            }
+            for s in resources["services"]
+            if s.get("spec", {}).get("type") != "ExternalName"
+        ],
+        "pods": [
+            {
+                "name":       p.get("metadata", {}).get("name"),
+                "namespace":  p.get("metadata", {}).get("namespace"),
+                "labels":     p.get("metadata", {}).get("labels", {}),
+                "phase":      p.get("status", {}).get("phase"),
+                "conditions": p.get("status", {}).get("conditions", []),
+                "containers": [
+                    {
+                        "name":  c.get("name"),
+                        "image": c.get("image"),
+                        "state": p.get("status", {}).get("containerStatuses", [{}])[idx].get("state", {})
+                                 if idx < len(p.get("status", {}).get("containerStatuses", []))
+                                 else {},
+                    }
+                    for idx, c in enumerate(p.get("spec", {}).get("containers", []))
+                ],
+            }
+            for p in resources["pods"]
+        ],
+    }
+
+    system_prompt = (
+        "You are a Kubernetes expert and Mermaid.js designer. Given raw Kubernetes resource data, "
+        "you will produce a clean, visual Mermaid.js flowchart (graph LR) showing the traffic flow: "
+        "Internet --> Ingress --> Service --> Pod.\n"
+        "Use distinct styling/classes or colors for the elements:\n"
+        "  - Internet: Globe/special shape.\n"
+        "  - Ingress: Teal color-coded style.\n"
+        "  - Service: Blue color-coded style.\n"
+        "  - Pods: Color-coded based on status (Running=Green, Pending=Yellow, Failed=Red, CrashLoopBackOff=Blinking/Dark Red, Unknown=Grey).\n"
+        "Keep it highly readable, with neat connection labels showing port/protocol.\n"
+        "Return ONLY the raw Mermaid diagram code block. Do not include markdown formatting or explanations."
+    )
+
+    user_message = (
+        "Here is the cluster resource data in JSON format:\n\n"
+        + json.dumps(slim, indent=2)
+    )
+
+    print("  Generating Mermaid diagram with OpenAI ...")
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_message},
+        ],
+        max_tokens=2048,
+        temperature=0.2,
+    )
+
+    content = response.choices[0].message.content.strip()
+    # Strip markdown block ticks if present
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if lines[0].startswith("```mermaid") or lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+    return content
+
+
+def save_mermaid_output(mermaid_code: str, output_path: str) -> None:
+    """Save Mermaid code as HTML, markdown, or raw text based on file extension."""
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    ext = output_file.suffix.lower()
+    if ext == ".html" or ext == ".htm":
+        html_template = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kubernetes Pod Traffic Topology</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {{
+            background-color: #0D1117;
+            color: #C9D1D9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }}
+        h1 {{
+            color: #FFFFFF;
+            font-size: 24px;
+            margin-bottom: 20px;
+        }}
+        .container {{
+            background-color: #161B22;
+            border: 1px solid #30363D;
+            border-radius: 8px;
+            padding: 24px;
+            width: 90%;
+            max-width: 1200px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            display: flex;
+            justify-content: center;
+            overflow-x: auto;
+        }}
+        .mermaid {{
+            background: transparent;
+        }}
+    </style>
+    <script>
+        mermaid.initialize({{
+            startOnLoad: true,
+            theme: 'dark',
+            securityLevel: 'loose',
+            flowchart: {{
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            }}
+        }});
+    </script>
+</head>
+<body>
+    <h1>Kubernetes Pod Traffic Topology</h1>
+    <div class="container">
+        <pre class="mermaid">
+{mermaid_code}
+        </pre>
+    </div>
+</body>
+</html>
+"""
+        output_file.write_text(html_template.format(mermaid_code=mermaid_code), encoding="utf-8")
+    elif ext == ".md":
+        md_content = f"""# Kubernetes Pod Traffic Topology
+
+```mermaid
+{mermaid_code}
+```
+"""
+        output_file.write_text(md_content, encoding="utf-8")
+    else:
+        # Default to raw text
+        output_file.write_text(mermaid_code, encoding="utf-8")
+
+    print(f"  Mermaid diagram saved to: {output_file.resolve()}")
+
+
+def generate_mermaid_locally(resources: dict) -> str:
+    """
+    Generate Mermaid.js flowchart syntax locally without any API calls.
+    """
+    lines = ["flowchart LR"]
+
+    # Define styles matching the visual identity of the project
+    lines.append("    %% Style Definitions")
+    lines.append("    classDef internet fill:#F3F4F6,stroke:#1F2937,stroke-width:2px,color:#111827;")
+    lines.append("    classDef ingress fill:#00BFA5,stroke:#00796B,stroke-width:2px,color:#000000;")
+    lines.append("    classDef service fill:#1565C0,stroke:#0D47A1,stroke-width:2px,color:#FFFFFF;")
+    lines.append("    classDef podRunning fill:#00C853,stroke:#1B5E20,stroke-width:2px,color:#FFFFFF;")
+    lines.append("    classDef podPending fill:#FFD600,stroke:#F57F17,stroke-width:2px,color:#000000;")
+    lines.append("    classDef podFailed fill:#D50000,stroke:#7F0000,stroke-width:2px,color:#FFFFFF;")
+    lines.append("    classDef podCrash fill:#FF1744,stroke:#880E4F,stroke-width:2px,color:#FFFFFF;")
+    lines.append("    classDef podUnknown fill:#607D8B,stroke:#37474F,stroke-width:2px,color:#FFFFFF;")
+
+    # 1. Internet Node
+    lines.append("    Internet((Internet))")
+    lines.append("    class Internet internet;")
+
+    ingresses = resources.get("ingresses", [])
+    services = resources.get("services", [])
+    pods = resources.get("pods", [])
+
+    # Track which services and pods are linked to show connections
+    linked_services = set()
+
+    # Helper to clean node IDs
+    def clean_id(name: str) -> str:
+        return name.replace("-", "_").replace(".", "_").replace("/", "_")
+
+    # 2. Ingress Nodes and connections to Internet
+    for ingress in ingresses:
+        name = ingress.get("metadata", {}).get("name", "")
+        namespace = ingress.get("metadata", {}).get("namespace", "default")
+        spec = ingress.get("spec", {})
+
+        # Collect hosts
+        hosts = []
+        for rule in spec.get("rules", []):
+            host = rule.get("host")
+            if host:
+                hosts.append(host)
+        host_str = ", ".join(hosts) if hosts else "all hosts"
+
+        node_id = f"Ingress_{clean_id(name)}"
+        label = f"Ingress: {name}<br/><small>{namespace}</small><br/><small>{host_str}</small>"
+
+        lines.append(f'    {node_id}["{label}"]')
+        lines.append(f"    class {node_id} ingress;")
+        lines.append(f"    Internet --> {node_id}")
+
+        # Connect Ingress rules to backend Services
+        backend_names = extract_ingress_service_names(ingress)
+        for backend_name in backend_names:
+            svc_node_id = f"Service_{clean_id(backend_name)}"
+            lines.append(f"    {node_id} -- \"HTTP\" --> {svc_node_id}")
+            linked_services.add(backend_name)
+
+    # 3. Service Nodes
+    for service in services:
+        name = service.get("metadata", {}).get("name", "")
+        namespace = service.get("metadata", {}).get("namespace", "default")
+        spec = service.get("spec", {})
+        svc_type = spec.get("type", "ClusterIP")
+
+        # Ports
+        ports_list = []
+        for p in spec.get("ports", []):
+            port = p.get("port")
+            target_port = p.get("targetPort")
+            protocol = p.get("protocol", "TCP")
+            ports_list.append(f"{protocol} {port}:{target_port}")
+        ports_str = ", ".join(ports_list)
+
+        node_id = f"Service_{clean_id(name)}"
+        label = f"Service: {name}<br/><small>{svc_type}</small><br/><small>{ports_str}</small>"
+
+        lines.append(f'    {node_id}["{label}"]')
+        lines.append(f"    class {node_id} service;")
+
+        # If Ingress wasn't defined/linked, show connection from Internet if LoadBalancer / NodePort
+        if name not in linked_services:
+            if svc_type in ("LoadBalancer", "NodePort"):
+                lines.append(f"    Internet -- \"{svc_type}\" --> {node_id}")
+
+        # Connect Service to Pods matching selector
+        selector = spec.get("selector", {})
+        for pod in pods:
+            pod_name = pod.get("metadata", {}).get("name", "")
+            pod_namespace = pod.get("metadata", {}).get("namespace", "default")
+
+            # Match only if same namespace
+            if pod_namespace == namespace:
+                pod_labels = pod.get("metadata", {}).get("labels", {})
+                if selector_matches_pod(selector, pod_labels):
+                    pod_node_id = f"Pod_{clean_id(pod_name)}"
+                    lines.append(f"    {node_id} --> {pod_node_id}")
+
+    # 4. Pod Nodes
+    for pod in pods:
+        name = pod.get("metadata", {}).get("name", "")
+        namespace = pod.get("metadata", {}).get("namespace", "default")
+        status = pod.get("status", {})
+        phase = status.get("phase", "Unknown")
+
+        # Determine specific detailed status (CrashLoopBackOff etc.)
+        container_statuses = status.get("containerStatuses", [])
+        detailed_status = phase
+        for cs in container_statuses:
+            waiting = cs.get("state", {}).get("waiting", {})
+            reason = waiting.get("reason", "")
+            if reason in ("CrashLoopBackOff", "ImagePullBackOff", "CreateContainerConfigError", "CreateContainerError"):
+                detailed_status = reason
+                break
+
+        # Container image
+        spec = pod.get("spec", {})
+        containers = spec.get("containers", [])
+        images = []
+        for c in containers:
+            img = c.get("image", "").split("/")[-1] # shorten image name
+            images.append(img)
+        images_str = ", ".join(images)
+
+        node_id = f"Pod_{clean_id(name)}"
+        label = f"Pod: {name}<br/><small>{detailed_status}</small><br/><small>{images_str}</small>"
+
+        lines.append(f'    {node_id}["{label}"]')
+
+        # Style pods by status
+        if detailed_status == "Running":
+            style_class = "podRunning"
+        elif detailed_status == "Pending":
+            style_class = "podPending"
+        elif detailed_status in ("Failed", "ImagePullBackOff", "CreateContainerConfigError", "CreateContainerError"):
+            style_class = "podFailed"
+        elif detailed_status == "CrashLoopBackOff":
+            style_class = "podCrash"
+        else:
+            style_class = "podUnknown"
+
+        lines.append(f"    class {node_id} {style_class};")
+
+    return "\n".join(lines)
+
+
+def is_key_set(val: str) -> bool:
+    if not val:
+        return False
+    val = val.strip()
+    # Check if value is a placeholder or empty
+    if val in ("", "sk-...", "luma-..."):
+        return False
+    if val.startswith("sk-...") or val.startswith("luma-..."):
+        return False
+    return True
+
+
+def validate_env(provider: str):
     """Ensure required environment variables are present."""
     missing = []
-    if not OPENAI_API_KEY:
-        missing.append("OPENAI_API_KEY")
-    if not LUMA_API_KEY:
+    if provider in ("luma", "openai", "dalle", "openai-mermaid"):
+        if not is_key_set(OPENAI_API_KEY):
+            missing.append("OPENAI_API_KEY")
+    if provider == "luma" and not is_key_set(LUMA_API_KEY):
         missing.append("LUMA_API_KEY or LUMA_API_TOKEN")
     if missing:
         print("ERROR: The following environment variables are not set:")
@@ -467,22 +843,49 @@ def main():
     parser.add_argument(
         "--output", "-o",
         default="pod-topology.png",
-        help="Output file path for the generated image (default: pod-topology.png).",
+        help="Output file path for the generated image/diagram (default: pod-topology.png).",
+    )
+    parser.add_argument(
+        "--provider", "-p",
+        choices=["luma", "openai", "dalle", "mermaid", "openai-mermaid"],
+        default="luma",
+        help="Diagram generation provider (default: 'luma'). Supports 'luma', 'openai' (DALL-E 3), 'mermaid' (local flowchart), 'openai-mermaid' (AI flowchart).",
     )
 
     args = parser.parse_args()
 
+    # Determine provider with automatic fallback based on key availability
+    provider = args.provider
+    has_luma = is_key_set(LUMA_API_KEY)
+    has_openai = is_key_set(OPENAI_API_KEY)
+
+    if provider == "luma" and not has_luma:
+        if has_openai:
+            print("INFO: LUMA_API_KEY is not set, but OPENAI_API_KEY is present. Falling back to 'openai' provider.")
+            provider = "openai"
+        else:
+            print("INFO: Neither LUMA_API_KEY nor OPENAI_API_KEY is set. Falling back to 'mermaid' provider (offline/local).")
+            provider = "mermaid"
+    elif provider in ("openai", "dalle", "openai-mermaid") and not has_openai:
+        print(f"INFO: OPENAI_API_KEY is not set. Falling back to 'mermaid' provider (offline/local).")
+        provider = "mermaid"
+
+    # Adjust default output extension for Mermaid if it wasn't customized
+    output_path = args.output
+    if provider in ("mermaid", "openai-mermaid") and output_path == "pod-topology.png":
+        output_path = "pod-topology.html"
+
     print("\n=== kubectl pod-topology ===\n")
 
     # Step 1: Validate API keys
-    validate_env()
+    validate_env(provider)
 
     # Step 2: Gather Kubernetes resources
-    print(f"[1/3] Gathering cluster resources (namespace: {args.namespace}) ...")
+    print(f"[1/4] Gathering cluster resources (namespace: {args.namespace}) ...")
     resources = gather_cluster_resources(args.namespace)
 
     # Step 3: Filter resources for the selected pod
-    print(f"[2/3] Building topology for pod: {args.pod_name} ...")
+    print(f"[2/4] Building topology for pod: {args.pod_name} ...")
     resources = filter_resources_for_pod(resources, args.pod_name)
 
     total = (
@@ -499,20 +902,40 @@ def main():
     if total == 0:
         print("WARNING: No resources found. Make sure your kubeconfig is set correctly.")
 
-    # Step 4: Analyze with OpenAI
-    print("\n[3/4] Analyzing traffic flow with OpenAI ...")
-    cluster_summary = analyze_with_openai(resources)
+    if provider in ("mermaid", "openai-mermaid"):
+        # Step 4: Generate Mermaid diagram
+        if provider == "mermaid":
+            print("\n[3/4] Generating topology Mermaid diagram locally ...")
+            mermaid_code = generate_mermaid_locally(resources)
+        else:
+            print("\n[3/4] Generating topology Mermaid diagram with OpenAI ...")
+            mermaid_code = generate_mermaid_with_openai(resources)
 
-    print("\n--- Cluster Traffic Summary ---")
-    print(cluster_summary)
-    print("-------------------------------\n")
+        print("\n--- Mermaid Flowchart Code ---")
+        print(mermaid_code)
+        print("------------------------------\n")
 
-    # Step 5: Generate image with Luma AI
-    print("[4/4] Generating topology image with Luma AI UNI-1 ...")
-    generate_image_with_luma(cluster_summary, args.output)
+        print("[4/4] Saving Mermaid diagram ...")
+        save_mermaid_output(mermaid_code, output_path)
+    else:
+        # Step 4: Analyze with OpenAI
+        print("\n[3/4] Analyzing traffic flow with OpenAI ...")
+        cluster_summary = analyze_with_openai(resources)
+
+        print("\n--- Cluster Traffic Summary ---")
+        print(cluster_summary)
+        print("-------------------------------\n")
+
+        # Step 5: Generate image using selected provider
+        if provider == "luma":
+            print("[4/4] Generating topology image with Luma AI UNI-1 ...")
+            generate_image_with_luma(cluster_summary, output_path)
+        else:
+            print("[4/4] Generating topology image with OpenAI DALL-E 3 ...")
+            generate_image_with_openai(cluster_summary, output_path)
 
     print("\n=== Done! ===")
-    print(f"Topology image: {Path(args.output).resolve()}\n")
+    print(f"Topology diagram saved to: {Path(output_path).resolve()}\n")
 
 
 if __name__ == "__main__":

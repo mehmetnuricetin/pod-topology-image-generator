@@ -6,7 +6,7 @@ A kubectl plugin that analyzes your Kubernetes cluster and generates a visual tr
 Internet --> Ingress --> Service --> Pod (Running / Pending / Failed)
 ```
 
-The diagram is rendered as a PNG image using Luma AI's UNI-1 image generation model.
+The diagram can be rendered as a PNG image using Luma AI's UNI-1 model or OpenAI's DALL-E 3, or generated as a text/HTML flowchart using Mermaid.js.
 
 ---
 
@@ -14,7 +14,7 @@ The diagram is rendered as a PNG image using Luma AI's UNI-1 image generation mo
 
 1. **Gather** - Calls `kubectl get ingresses`, `kubectl get services`, and `kubectl get pods` against your live cluster.
 2. **Analyze** - Sends the resource data to OpenAI (`gpt-4o`) which maps Ingress rules to backend Services and Services to their selected Pods via label selectors, producing a structured traffic flow summary.
-3. **Generate** - Injects the summary into a hardcoded visual-style prompt and submits it to the Luma AI UNI-1 API. The hardcoded prompt ensures a consistent diagram style on every run - only the cluster-specific values change.
+3. **Generate** - Injects the summary into a visual-style prompt and submits it to the selected provider (Luma AI UNI-1, OpenAI DALL-E 3), or generates an interactive Mermaid.js diagram directly. If `LUMA_API_KEY` is not present, it will automatically fall back to OpenAI DALL-E 3.
 
 ---
 
@@ -22,8 +22,8 @@ The diagram is rendered as a PNG image using Luma AI's UNI-1 image generation mo
 
 - Python 3.9 or newer
 - `kubectl` installed and configured with a valid kubeconfig
-- An OpenAI API key (for cluster analysis via `gpt-4o`)
-- A Luma AI API key (for image generation via UNI-1)
+- An OpenAI API key (for cluster analysis and OpenAI/Mermaid rendering)
+- A Luma AI API key (optional, only needed if using Luma AI generation)
 
 ---
 
@@ -55,7 +55,7 @@ cp .env.example .env.local
 `.env.local`:
 ```
 OPENAI_API_KEY=sk-...
-LUMA_API_KEY=luma-...
+LUMA_API_KEY=luma-... (optional, only required for luma provider)
 ```
 
 The `.env.local` and `.env` files are listed in `.gitignore` and will never be committed to version control.
@@ -73,6 +73,12 @@ kubectl pod-topology nginx-topology-65b47b4648-4nktm -n default -o /tmp/staging-
 
 # Prefix matching is supported for convenience
 kubectl pod-topology nginx-topology -n default
+
+# Generate using DALL-E 3 (OpenAI)
+kubectl pod-topology nginx-topology -n default --provider openai
+
+# Generate as a local Mermaid.js interactive HTML flowchart
+kubectl pod-topology nginx-topology -n default --provider mermaid
 ```
 
 ### Options
@@ -81,7 +87,8 @@ kubectl pod-topology nginx-topology -n default
 |------|-------|---------|-------------|
 | `pod_name` | n/a | required | Target pod name (exact or prefix). |
 | `--namespace` | `-n` | `default` | Namespace to inspect. Use `all` for all namespaces. |
-| `--output` | `-o` | `pod-topology.png` | Output path for the generated PNG image. |
+| `--output` | `-o` | `pod-topology.png` (or `pod-topology.html` for mermaid) | Output path for the generated image/diagram. |
+| `--provider` | `-p` | `luma` | Diagram generation provider: `luma` (Luma AI), `openai` / `dalle` (DALL-E 3), `mermaid` (HTML/Markdown flowchart). Falls back to `openai` if `LUMA_API_KEY` is not set. |
 
 ---
 
