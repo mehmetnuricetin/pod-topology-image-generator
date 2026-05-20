@@ -92,6 +92,27 @@ kubectl pod-topology nginx-topology -n default --provider mermaid
 
 ---
 
+### Keyless & Offline Mode (Mermaid.js)
+
+If you do not have any API keys configured, or if you explicitly request `--provider mermaid`, the plugin runs completely offline in keyless mode:
+
+1. It extracts K8s connections directly from your cluster selectors.
+2. It outputs a self-contained interactive dark-themed HTML file (default: `pod-topology.html`).
+3. Open `pod-topology.html` in any web browser to view the rendered diagram locally.
+4. To convert the diagram into a static PNG image, you can:
+   - Open `pod-topology.html` in your browser and take a screenshot.
+   - Or, export the raw Mermaid code block and use `mermaid-cli` (`mmdc`):
+     ```bash
+     # Save the output as a raw Mermaid text file
+     kubectl pod-topology nginx-topology -n default --provider mermaid -o pod-topology.txt
+
+     # Render the text file to a PNG image
+     npm install -g @mermaid-js/mermaid-cli
+     mmdc -i pod-topology.txt -o pod-topology.png
+     ```
+
+---
+
 ## Example output
 
 The generated image shows:
